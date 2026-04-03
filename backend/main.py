@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import time
+from dotenv import load_dotenv
 
 # ------------------ FIX OPENMP ERROR ------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -20,28 +21,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # ------------------ APP INIT ------------------
 app = FastAPI()
 
-
-def _load_dotenv_file():
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.exists(env_path):
-        return
-
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            raw = line.strip()
-            if not raw or raw.startswith("#") or "=" not in raw:
-                continue
-
-            key, value = raw.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-
-            # Respect already-set environment variables (e.g. deployment secrets).
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-
-_load_dotenv_file()
+load_dotenv()
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -53,10 +33,10 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-DEFAULT_MONGO_URI = "your_actual_connection_string"
-MONGO_URI = _get_env("MONGO_URI", DEFAULT_MONGO_URI)
-if MONGO_URI == DEFAULT_MONGO_URI:
-    print("[WARN] Using fallback Mongo URI. Set MONGO_URI env var for production.")
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not MONGO_URI:
+    raise ValueError("MONGO_URI is not set")
 
 DB_NAME = _get_env("DB_NAME", "keystroke_saas")
 BASE_DIR = os.path.dirname(__file__)
@@ -871,4 +851,5 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
