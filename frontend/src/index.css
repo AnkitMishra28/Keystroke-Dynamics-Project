@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: radial-gradient(circle at 20% 10%, #20103a 0%, #0a0016 60%, #050007 100%);
+  overflow-x: hidden;
+}
