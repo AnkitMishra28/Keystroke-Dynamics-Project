@@ -47,7 +47,14 @@ STD_PATH = _get_env("STD_PATH", os.path.abspath(os.path.join(BASE_DIR, "..", "mo
 TOKEN_SECRET = _get_env("TOKEN_SECRET", "dev-only-change-me")
 TOKEN_TTL_MINUTES = int(_get_env("TOKEN_TTL_MINUTES", "120"))
 
-CORS_ORIGINS = [origin.strip() for origin in _get_env("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
+DEFAULT_CORS_ORIGINS = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://keystroke-dynamics-project.vercel.app",
+}
+configured_origins = [origin.strip() for origin in _get_env("CORS_ORIGINS", "").split(",") if origin.strip()]
+CORS_ORIGINS = sorted(DEFAULT_CORS_ORIGINS.union(configured_origins))
+CORS_ORIGIN_REGEX = _get_env("CORS_ORIGIN_REGEX", r"https://.*\.vercel\.app")
 
 MAX_LOGIN_ATTEMPTS = int(_get_env("MAX_LOGIN_ATTEMPTS", "5"))
 LOCKOUT_SECONDS = int(_get_env("LOCKOUT_SECONDS", "300"))
@@ -63,8 +70,9 @@ SKIP_MODEL_LOAD = _get_bool_env("SKIP_MODEL_LOAD", False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
