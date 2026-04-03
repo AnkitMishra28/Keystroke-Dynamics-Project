@@ -53,7 +53,7 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-DEFAULT_MONGO_URI = "mongodb+srv://ankit:ankit123@cluster0.mqmpyhx.mongodb.net/?appName=Cluster0"
+DEFAULT_MONGO_URI = "your_actual_connection_string"
 MONGO_URI = _get_env("MONGO_URI", DEFAULT_MONGO_URI)
 if MONGO_URI == DEFAULT_MONGO_URI:
     print("[WARN] Using fallback Mongo URI. Set MONGO_URI env var for production.")
