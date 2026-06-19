@@ -1,10 +1,11 @@
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 import torch
 import numpy as np
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
 import base64
@@ -32,11 +33,6 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
     raw = _get_env(name, "1" if default else "0").lower()
     return raw in {"1", "true", "yes", "on"}
 
-
-MONGO_URI = os.getenv("MONGO_URI")
-
-if not MONGO_URI:
-    raise ValueError("MONGO_URI is not set")
 
 DB_NAME = _get_env("DB_NAME", "keystroke_saas")
 BASE_DIR = os.path.dirname(__file__)
@@ -77,25 +73,55 @@ app.add_middleware(
 )
 
 # ------------------ DATABASE ------------------
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-collection = db["users"]
-sessions_collection = db["sessions"]
-alerts_collection = db["alerts"]
+from database import get_database, is_database_connected, safe_print
 
+db = get_database()
+collection = db["users"] if db is not None else None
+sessions_collection = db["sessions"] if db is not None else None
+alerts_collection = db["alerts"] if db is not None else None
+
+def _resolve_db_and_collections():
+    global db, collection, sessions_collection, alerts_collection
+    if collection is not None and hasattr(collection, "docs"):
+        if db is None:
+            db = "mock_database"
+        return db, collection, sessions_collection, alerts_collection
+
+    db = get_database()
+    if db is not None:
+        collection = db["users"]
+        sessions_collection = db["sessions"]
+        alerts_collection = db["alerts"]
+    else:
+        collection = None
+        sessions_collection = None
+        alerts_collection = None
+
+    return db, collection, sessions_collection, alerts_collection
+
+@app.on_event("startup")
+def startup_event():
+    safe_print("🚀 FastAPI Started")
 
 if not SKIP_STARTUP_DB_INIT:
-    try:
-        collection.create_index(
-            [("username_normalized", ASCENDING)],
-            unique=True,
-            partialFilterExpression={"username_normalized": {"$type": "string"}}
-        )
-    except Exception as exc:
-        print(f"[WARN] Could not create unique username index: {exc}")
+    db_conn, col, s_col, a_col = _resolve_db_and_collections()
+    if db_conn is not None and col is not None and s_col is not None and a_col is not None:
+        try:
+            col.create_index(
+                [("username_normalized", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"username_normalized": {"$type": "string"}}
+            )
+        except Exception as exc:
+            print(f"[WARN] Could not create unique username index: {exc}")
 
-    sessions_collection.create_index([("username_normalized", ASCENDING), ("time", ASCENDING)])
-    alerts_collection.create_index([("username_normalized", ASCENDING), ("time", ASCENDING)])
+        try:
+            s_col.create_index([("username_normalized", ASCENDING), ("time", ASCENDING)])
+            a_col.create_index([("username_normalized", ASCENDING), ("time", ASCENDING)])
+        except Exception as exc:
+            print(f"[WARN] Could not create sessions/alerts indexes: {exc}")
+    else:
+        print("[WARN] MongoDB is unavailable. Index creation skipped.")
 
 MIN_KEYSTROKES = 20
 REQUIRED_ENROLLMENTS = 3
@@ -352,14 +378,21 @@ def _record_suspicious_alert(
     request: Request,
     metadata: dict | None = None
 ):
-    alerts_collection.insert_one({
-        "username": username,
-        "username_normalized": username_normalized,
-        "time": str(datetime.now()),
-        "ip": request.client.host if request.client else "unknown",
-        "reason": reason,
-        "metadata": metadata or {}
-    })
+    db_conn, _, _, alerts_col = _resolve_db_and_collections()
+    if db_conn is None or alerts_col is None:
+        print(f"[WARN] Database unavailable. Cannot record suspicious alert for user: {username_normalized}")
+        return
+    try:
+        alerts_col.insert_one({
+            "username": username,
+            "username_normalized": username_normalized,
+            "time": str(datetime.now()),
+            "ip": request.client.host if request.client else "unknown",
+            "reason": reason,
+            "metadata": metadata or {}
+        })
+    except Exception as exc:
+        print(f"[WARN] Failed to write alert to database: {exc}")
 
 
 def _validate_and_convert_events(raw_keystrokes: list[dict]) -> list[KeystrokeEvent]:
@@ -531,6 +564,13 @@ def _parse_request_features(data: UserInput) -> tuple[np.ndarray, np.ndarray]:
 
 @app.post("/register")
 def register(data: UserInput, request: Request):
+    db_conn, col, _, _ = _resolve_db_and_collections()
+    if db_conn is None or col is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"success": False, "message": "Database unavailable"}
+        )
+
     _check_rate_limit(f"register:{request.client.host}")
     if not data.username or not data.username.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username cannot be empty")
@@ -541,7 +581,7 @@ def register(data: UserInput, request: Request):
     embedding = _build_embedding(features_norm).tolist()
     sample_mean, sample_std = _extract_stat_vectors(features_raw)
 
-    user = collection.find_one({"username_normalized": username_normalized})
+    user = col.find_one({"username_normalized": username_normalized})
     embeddings = _get_user_embeddings(user) if user else []
     feature_profiles = _get_feature_profiles(user) if user else []
     is_legacy_user = bool(user and not user.get("password_hash"))
@@ -565,7 +605,7 @@ def register(data: UserInput, request: Request):
         )
 
     if is_legacy_user and len(embeddings) >= MAX_ENROLLMENTS_TO_KEEP:
-        collection.update_one(
+        col.update_one(
             {"username_normalized": username_normalized},
             {
                 "$set": {
@@ -609,7 +649,7 @@ def register(data: UserInput, request: Request):
 
     threshold = _adaptive_threshold(embeddings, feature_profiles)
 
-    collection.update_one(
+    col.update_one(
         {"username_normalized": username_normalized},
         {
             "$set": {
@@ -652,6 +692,13 @@ def register(data: UserInput, request: Request):
 
 @app.post("/login")
 def login(data: UserInput, request: Request):
+    db_conn, col, sessions_col, alerts_col = _resolve_db_and_collections()
+    if db_conn is None or col is None or sessions_col is None or alerts_col is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"success": False, "message": "Database unavailable"}
+        )
+
     _check_rate_limit(f"login:{request.client.host}")
     if not data.username or not data.username.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username cannot be empty")
@@ -661,7 +708,7 @@ def login(data: UserInput, request: Request):
     username, username_normalized = _normalize_username(data.username)
     _check_lockout(username_normalized)
 
-    user = collection.find_one({"username_normalized": username_normalized})
+    user = col.find_one({"username_normalized": username_normalized})
     if user is None:
         _record_failed_login(username_normalized)
         _record_suspicious_alert(username, username_normalized, "unknown_user_attempt", request)
@@ -710,7 +757,7 @@ def login(data: UserInput, request: Request):
                 "threshold": float(threshold)
             }
         )
-        sessions_collection.insert_one({
+        sessions_col.insert_one({
             "username": username,
             "username_normalized": username_normalized,
             "time": str(datetime.now()),
@@ -760,7 +807,7 @@ def login(data: UserInput, request: Request):
             }
         )
 
-    sessions_collection.insert_one({
+    sessions_col.insert_one({
         "username": username,
         "username_normalized": username_normalized,
         "time": str(datetime.now()),
@@ -796,12 +843,18 @@ def login(data: UserInput, request: Request):
 
 @app.get("/analytics/{username}")
 def get_analytics(username: str, current_user: str = Depends(_get_current_user)):
+    db_conn, _, sessions_col, _ = _resolve_db_and_collections()
+    if db_conn is None or sessions_col is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable"
+        )
 
     _, username_normalized = _normalize_username(username)
     if username_normalized != current_user:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: token does not match user")
 
-    sessions = list(sessions_collection.find({"username_normalized": username_normalized}, {"_id": 0, "username_normalized": 0}))
+    sessions = list(sessions_col.find({"username_normalized": username_normalized}, {"_id": 0, "username_normalized": 0}))
 
     return {
         "sessions": sessions
@@ -810,12 +863,19 @@ def get_analytics(username: str, current_user: str = Depends(_get_current_user))
 
 @app.get("/alerts/{username}")
 def get_alerts(username: str, current_user: str = Depends(_get_current_user)):
+    db_conn, _, _, alerts_col = _resolve_db_and_collections()
+    if db_conn is None or alerts_col is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable"
+        )
+
     _, username_normalized = _normalize_username(username)
     if username_normalized != current_user:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: token does not match user")
 
     alerts = list(
-        alerts_collection.find(
+        alerts_col.find(
             {"username_normalized": username_normalized},
             {"_id": 0, "username_normalized": 0}
         ).sort("time", -1)
@@ -825,6 +885,13 @@ def get_alerts(username: str, current_user: str = Depends(_get_current_user)):
 
 @app.post("/admin/reset-users")
 def reset_users(request: Request):
+    db_conn, col, sessions_col, alerts_col = _resolve_db_and_collections()
+    if db_conn is None or col is None or sessions_col is None or alerts_col is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable"
+        )
+
     if not ALLOW_DB_RESET:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Database reset is disabled")
 
@@ -833,9 +900,9 @@ def reset_users(request: Request):
         if provided_key != ADMIN_RESET_KEY:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin reset key")
 
-    users_result = collection.delete_many({})
-    sessions_result = sessions_collection.delete_many({})
-    alerts_result = alerts_collection.delete_many({})
+    users_result = col.delete_many({})
+    sessions_result = sessions_col.delete_many({})
+    alerts_result = alerts_col.delete_many({})
 
     return {
         "message": "Authentication data reset complete",
@@ -847,12 +914,19 @@ def reset_users(request: Request):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "service": "keystroke-backend",
-        "db_init_skipped": SKIP_STARTUP_DB_INIT,
-        "model_loaded": model is not None
-    }
+    connected = is_database_connected()
+    if connected:
+        return {
+            "status": "ok",
+            "mongodb_connected": True,
+            "service": "keystroke-backend"
+        }
+    else:
+        return {
+            "status": "degraded",
+            "mongodb_connected": False,
+            "service": "keystroke-backend"
+        }
 
 
 # ------------------ RUN SERVER ------------------

@@ -12,7 +12,7 @@ import {
   Legend
 } from "recharts";
 
-const API_URL = "https://keystroke-dynamics-project.onrender.com";
+const API_URL = process.env.REACT_APP_API_URL || "https://keystroke-dynamics-project.onrender.com";
 
 export default function Dashboard() {
   const location = useLocation();
